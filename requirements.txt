@@ -1,0 +1,9 @@
+litellm
+pypdf
+crewai
+crewai-tools
+streamlit
+sqlalchemy
+pydantic
+python-dotenv
+tavily-python
