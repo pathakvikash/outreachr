@@ -25,6 +25,20 @@ with st.sidebar:
     else:
         st.info("No profile stored. Upload a resume to get started.")
 
+
+def parse_pdf(uploaded_file):
+    """Helper to extract text from an uploaded PDF file."""
+    try:
+        from pypdf import PdfReader
+        reader = PdfReader(uploaded_file)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    except Exception as e:
+        st.error(f"Error reading PDF: {e}")
+        return None
+        
 # --- Main Interface ---
 tab1 = st.tabs(["New Outreach (Recruiters)"])
 
@@ -44,15 +58,7 @@ with tab1:
     if not use_stored_profile:
         uploaded_resume_manual = st.file_uploader("Upload Specific Resume (Optional Override)", type="pdf", key="manual_resume")
         if uploaded_resume_manual:
-             from pypdf import PdfReader
-             try:
-                reader = PdfReader(uploaded_resume_manual)
-                text = ""
-                for page in reader.pages:
-                    text += page.extract_text() + "\n"
-                resume_context = text.strip()
-             except:
-                 pass
+             resume_context = parse_pdf(uploaded_resume_manual)
     else:
         # Use stored raw text or summary for context
         resume_context = current_profile.get("raw_text")
@@ -62,20 +68,12 @@ with tab1:
     if uploaded_resume_sidebar:
         if st.button("Process & Update Profile"):
             with st.spinner("Parsing resume and building profile..."):
-                from pypdf import PdfReader
-                try:
-                    reader = PdfReader(uploaded_resume_sidebar)
-                    text = ""
-                    for page in reader.pages:
-                        text += page.extract_text() + "\n"
-                    raw_text = text.strip()
-                    
+                raw_text = parse_pdf(uploaded_resume_sidebar)
+                if raw_text:
                     # Run Agent
                     run_profile_parsing(raw_text)
                     st.success("Profile Updated Successfully!")
                     st.rerun()
-                except Exception as e:
-                    st.error(f"Error processing resume: {e}")
 
     force_refresh = st.checkbox("Force Refresh (Ignore Cache)")
     
