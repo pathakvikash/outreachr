@@ -40,7 +40,7 @@ def parse_pdf(uploaded_file):
         return None
         
 # --- Main Interface ---
-tab1 = st.tabs(["New Outreach (Recruiters)"])
+tab1, tab2, tab3, tab4 = st.tabs(["New Outreach (Recruiters)", "Job Application Assistant", "History", "Settings"])
 
 # TAB 1: Recruiter Outreach
 with tab1:
@@ -104,3 +104,98 @@ with tab1:
                         st.warning("No results found or an error occurred.")
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
+
+ation Assistant
+with tab2:
+    st.header("Job Application Assistant")
+    st.markdown("Generate a tailored Cold DM and Cover Letter for a specific Job Description.")
+    
+    if not current_profile:
+        st.warning("⚠️ Please upload your resume in the Sidebar to use this feature.")
+    else:
+        jd_input = st.text_area("Paste Job Description (JD)", height=300, placeholder="Paste the full job description here...")
+        
+        if st.button("Generate Application Kit"):
+            if not jd_input:
+                st.error("Please paste a Job Description.")
+            else:
+                 with st.spinner("Analyzing JD and crafting tailored assets..."):
+                    try:
+                        app_data = run_job_application(jd_input)
+                        results = app_data.get("results", {})
+                        usage = app_data.get("usage", {})
+                        
+                        if results:
+                             st.success("Assets Generated!")
+                             
+                             col_dm, col_cov = st.columns(2)
+                             
+                             with col_dm:
+                                 st.subheader("Cold DM (LinkedIn)")
+                                 st.info(results.get("cold_dm", "No DM generated."))
+                                 st.button("Copy DM", disabled=True, help="Streamlit copy coming soon")
+
+                             with col_cov:
+                                 st.subheader("Cover Letter / Email Pitch")
+                                 st.text_area("Email Content", value=results.get("cover_letter", ""), height=400)
+                        else:
+                            st.error("Failed to generate assets.")
+                            
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+# TAB 3: History
+with tab3:
+    st.header("Outreach History")
+    if st.button("Refresh History"):
+        st.rerun()
+        
+    db = next(get_db())
+    
+    st.subheader("Accumulated Usage")
+    usage_logs = db.query(UsageLog).all()
+    if usage_logs:
+        total_tokens = sum(log.total_tokens for log in usage_logs)
+        st.metric("Total Tokens Used (All Time)", total_tokens)
+    else:
+        st.info("No usage logs yet.")
+
+    st.markdown("---")
+    history = db.query(RecruiterOutreach).order_by(RecruiterOutreach.created_at.desc()).all()
+    
+    if history:
+        data = [r.to_dict() | {"created_at": r.created_at, "company_name": r.company_name, "job_role": r.job_role} for r in history]
+        df = pd.DataFrame(data)
+        st.dataframe(df.drop(columns=["draft_message", "reason_for_ranking"]), use_container_width=True)
+        
+        selected_id = st.selectbox("Select a Record to View Details", options=range(len(data)), format_func=lambda x: f"{data[x]['company_name']} - {data[x]['recruiter_name']}")
+        if selected_id is not None:
+             record = data[selected_id]
+             st.markdown(f"### {record['recruiter_name']} at {record['company_name']}")
+             st.markdown(f"**Role:** {record['job_role']}")
+             st.markdown(f"**LinkedIn:** {record['linkedin_url']}")
+             st.info(f"**Reason:** {record['reason_for_ranking']}")
+             st.success(f"**Draft Message:**\n\n{record['draft_message']}")
+    else:
+        st.info("No history found.")
+
+# TAB 4: Settings
+with tab4:
+    st.header("Settings")
+    st.markdown("### API Keys")
+    openai_key = st.text_input("OpenAI API Key", type="password", placeholder="sk-...", key="openai_key")
+    tavily_key = st.text_input("Tavily API Key", type="password", placeholder="sk-...", key="tavily_key")
+    
+    if st.button("Save API Keys"):
+        os.environ["OPENAI_API_KEY"] = openai_key
+        os.environ["TAVILY_API_KEY"] = tavily_key
+        st.success("API keys saved successfully!")
+
+    st.markdown("---")
+    st.markdown("### Database Settings")
+    database_url = st.text_input("Database URL", placeholder="sqlite:///recruiter_outreach.db", key="database_url")
+    
+    if st.button("Save Database Settings"):
+        os.environ["DATABASE_URL"] = database_url
+        st.success("Database settings saved successfully!")
+
