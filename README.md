@@ -27,3 +27,25 @@ Run the script with the company name and target role:
 ```bash
 python main.py --company "Google" --role "Software Engineer"
 ```
+
+## How it Works
+
+1.  **Cache Check**: Checks the local database for recent outreach (last 24 hours).
+2.  **Research Agent**: Finds recruiters using Tavily (or mock data).
+3.  **Ranking Agent**: Selects the top 3 relevant recruiters.
+4.  **Copywriter Agent**: Drafts a personalized LinkedIn DM for each.
+5.  **Output**: Prints the result as JSON and saves it to the database.
+
+## Output Format
+
+The output is a JSON list:
+```json
+[
+  {
+    "recruiter_name": "Name",
+    "linkedin_url": "URL",
+    "reason_for_ranking": "Reason...",
+    "draft_message": "Message..."
+  }
+]
+```
