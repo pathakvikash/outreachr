@@ -2,110 +2,150 @@ import os
 import json
 import datetime
 import argparse
-from typing import List, Dict
+import hashlib
+from typing import Any, Dict, List, Optional
 from crewai import Crew, Process
 from dotenv import load_dotenv
 from pypdf import PdfReader
 
-from models import init_db, get_db, RecruiterOutreach, UsageLog, UserProfile
+from models import db_session, init_db, RecruiterOutreach, UsageLog, UserProfile
 from agents import RecruiterOutreachAgents, RecruiterOutreachTasks
 
 # Load environment variables
 load_dotenv()
 
+PROMPT_VERSION = "2026-05-07"
+
+
+def normalize_key(value: str) -> str:
+    """Normalize cache key inputs so whitespace/case changes do not miss cache."""
+    return " ".join((value or "").strip().lower().split())
+
+
+def get_profile_hash(profile_context: Optional[str]) -> str:
+    if not profile_context:
+        return "no-profile"
+    return hashlib.sha256(profile_context.encode("utf-8")).hexdigest()[:16]
+
+
+def get_search_mode() -> str:
+    return "mock" if os.getenv("MOCK_SEARCH", "False").lower() == "true" else "real"
+
 def save_user_profile(raw_text: str, summary_json: str):
     """Save or update the user profile."""
     try:
-        db = next(get_db())
-        # Check if profile exists (Single User Mode)
-        profile = db.query(UserProfile).first()
-        if profile:
-            profile.raw_text = raw_text
-            profile.summary_json = summary_json
-            profile.updated_at = datetime.datetime.utcnow()
-        else:
-            profile = UserProfile(raw_text=raw_text, summary_json=summary_json)
-            db.add(profile)
-        db.commit()
+        with db_session() as db:
+            # Single-user MVP profile. Add user_id before deploying this as multi-user.
+            profile = db.query(UserProfile).first()
+            if profile:
+                profile.raw_text = raw_text
+                profile.summary_json = summary_json
+                profile.updated_at = datetime.datetime.utcnow()
+            else:
+                profile = UserProfile(raw_text=raw_text, summary_json=summary_json)
+                db.add(profile)
     except Exception as e:
         print(f"Error saving profile: {e}")
 
 def get_user_profile() -> Dict:
     """Fetch the user profile."""
-    db = next(get_db())
-    profile = db.query(UserProfile).first()
-    if profile:
-        return {
-            "raw_text": profile.raw_text,
-            "summary_json": profile.summary_json,
-            "updated_at": profile.updated_at
-        }
+    with db_session() as db:
+        profile = db.query(UserProfile).first()
+        if profile:
+            return {
+                "raw_text": profile.raw_text,
+                "summary_json": profile.summary_json,
+                "updated_at": profile.updated_at
+            }
     return None
 
 def save_usage_log(usage_metrics: dict):
     """Save crew usage metrics to database."""
     try:
-        db = next(get_db())
-        
         if usage_metrics is None:
             return
-  
+
         prompt_tokens = usage_metrics.get("prompt_tokens", 0)
         completion_tokens = usage_metrics.get("completion_tokens", 0)
         total_tokens = usage_metrics.get("total_tokens", 0)
-        
-        log = UsageLog(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=total_tokens,
-            total_cost=0.0 
-        )
-        db.add(log)
-        db.commit()
+
+        with db_session() as db:
+            log = UsageLog(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                total_cost=usage_metrics.get("total_cost", 0.0) or 0.0,
+            )
+            db.add(log)
     except Exception as e:
         print(f"Error saving usage log: {e}")
 
-def get_recent_outreach(company: str, role: str) -> List[Dict]:
+def get_recent_outreach(
+    company: str,
+    role: str,
+    profile_hash: str,
+    prompt_version: str,
+    search_mode: str,
+) -> List[Dict]:
     """Check database for outreach generated in the last 24 hours."""
-    db = next(get_db())
     one_day_ago = datetime.datetime.utcnow() - datetime.timedelta(days=1)
-    
-    results = db.query(RecruiterOutreach).filter(
-        RecruiterOutreach.company_name == company,
-        RecruiterOutreach.job_role == role,
-        RecruiterOutreach.created_at >= one_day_ago
-    ).all()
-    
-    return [r.to_dict() for r in results]
 
-def save_outreach(company: str, role: str, outreach_data: List[Dict]):
-    """Save generated outreach to database (Upsert)."""
-    db = next(get_db())
-    for item in outreach_data:
-        existing = db.query(RecruiterOutreach).filter(
+    with db_session() as db:
+        results = db.query(RecruiterOutreach).filter(
             RecruiterOutreach.company_name == company,
             RecruiterOutreach.job_role == role,
-            RecruiterOutreach.linkedin_url == item.get("linkedin_url")
-        ).first()
+            RecruiterOutreach.profile_hash == profile_hash,
+            RecruiterOutreach.prompt_version == prompt_version,
+            RecruiterOutreach.search_mode == search_mode,
+            RecruiterOutreach.created_at >= one_day_ago
+        ).all()
 
-        if existing:
-            existing.recruiter_name = item.get("recruiter_name")
-            existing.reason_for_ranking = item.get("reason_for_ranking")
-            existing.draft_message = item.get("draft_message")
-            existing.created_at = datetime.datetime.utcnow() 
-        else:
-            record = RecruiterOutreach(
-                company_name=company,
-                job_role=role,
-                recruiter_name=item.get("recruiter_name"),
-                linkedin_url=item.get("linkedin_url"),
-                reason_for_ranking=item.get("reason_for_ranking"),
-                draft_message=item.get("draft_message")
-            )
-            db.add(record)
-    db.commit()
+        return [r.to_dict() for r in results]
 
-def clean_json_output(output_str: str) -> List[Dict]:
+def save_outreach(
+    company: str,
+    role: str,
+    outreach_data: List[Dict],
+    profile_hash: str,
+    prompt_version: str,
+    search_mode: str,
+):
+    """Save generated outreach to database (Upsert)."""
+    with db_session() as db:
+        for item in outreach_data:
+            linkedin_url = str(item.get("linkedin_url", "")).strip()
+            if not linkedin_url:
+                continue
+
+            existing = db.query(RecruiterOutreach).filter(
+                RecruiterOutreach.company_name == company,
+                RecruiterOutreach.job_role == role,
+                RecruiterOutreach.linkedin_url == linkedin_url,
+                RecruiterOutreach.profile_hash == profile_hash,
+                RecruiterOutreach.prompt_version == prompt_version,
+                RecruiterOutreach.search_mode == search_mode,
+            ).first()
+
+            if existing:
+                existing.recruiter_name = item.get("recruiter_name")
+                existing.reason_for_ranking = item.get("reason_for_ranking")
+                existing.draft_message = item.get("draft_message")
+                existing.created_at = datetime.datetime.utcnow()
+            else:
+                record = RecruiterOutreach(
+                    company_name=company,
+                    job_role=role,
+                    profile_hash=profile_hash,
+                    prompt_version=prompt_version,
+                    search_mode=search_mode,
+                    recruiter_name=item.get("recruiter_name"),
+                    linkedin_url=linkedin_url,
+                    reason_for_ranking=item.get("reason_for_ranking"),
+                    draft_message=item.get("draft_message")
+                )
+                db.add(record)
+
+def clean_json_output(output_str: str) -> Any:
     """Clean and parse JSON output from LLM."""
     try:
         # Remove markdown code blocks if present
@@ -122,6 +162,98 @@ def clean_json_output(output_str: str) -> List[Dict]:
         print(f"Error parsing JSON: {e}")
         print(f"Raw output: {output_str}")
         return []
+
+
+def object_to_dict(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return to_json_safe(value)
+    if hasattr(value, "model_dump"):
+        return to_json_safe(value.model_dump(mode="json"))
+    if hasattr(value, "dict"):
+        return to_json_safe(value.dict())
+    return None
+
+
+def to_json_safe(value: Any) -> Any:
+    """Recursively convert Pydantic/LiteLLM helper types into JSON-native values."""
+    if isinstance(value, dict):
+        return {str(key): to_json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [to_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [to_json_safe(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, datetime.datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def get_structured_output(task, result) -> Any:
+    """Read CrewAI structured task output, falling back to raw JSON cleanup."""
+    for candidate in [getattr(task, "output", None), result]:
+        if candidate is None:
+            continue
+
+        json_dict = getattr(candidate, "json_dict", None)
+        if json_dict:
+            return json_dict
+
+        pydantic_value = getattr(candidate, "pydantic", None)
+        parsed = object_to_dict(pydantic_value)
+        if parsed:
+            return parsed
+
+        parsed = object_to_dict(candidate)
+        if parsed:
+            return parsed
+
+    return clean_json_output(str(result))
+
+
+def extract_outreach_items(parsed_output: Any) -> List[Dict]:
+    if isinstance(parsed_output, dict):
+        items = parsed_output.get("recruiters", [])
+    elif isinstance(parsed_output, list):
+        items = parsed_output
+    else:
+        items = []
+
+    cleaned_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        cleaned_items.append({
+            "recruiter_name": item.get("recruiter_name", "").strip(),
+            "linkedin_url": str(item.get("linkedin_url", "")).strip(),
+            "reason_for_ranking": item.get("reason_for_ranking", "").strip(),
+            "draft_message": item.get("draft_message", "").strip(),
+        })
+    return [item for item in cleaned_items if item["recruiter_name"] and item["linkedin_url"]][:3]
+
+
+def extract_usage_metrics(crew, result=None) -> Dict:
+    raw_usage = None
+    if hasattr(crew, "usage_metrics"):
+        raw_usage = crew.usage_metrics
+    elif result is not None and hasattr(result, "token_usage"):
+        raw_usage = result.token_usage
+
+    usage = object_to_dict(raw_usage)
+    if usage is not None:
+        return usage
+
+    if raw_usage:
+        return {
+            "prompt_tokens": getattr(raw_usage, "prompt_tokens", 0),
+            "completion_tokens": getattr(raw_usage, "completion_tokens", 0),
+            "total_tokens": getattr(raw_usage, "total_tokens", 0),
+            "total_cost": getattr(raw_usage, "total_cost", 0.0),
+        }
+
+    return {}
 
 
 def extract_text_from_pdf(pdf_path: str) -> str:
@@ -142,12 +274,22 @@ def run_recruiter_outreach(company_name: str, job_role: str, resume_content: str
     Returns dictionary with 'results' (list) and 'usage' (dict).
     """
     init_db()
+    company_key = normalize_key(company_name)
+    role_key = normalize_key(job_role)
+    profile_hash = get_profile_hash(resume_content)
+    search_mode = get_search_mode()
 
     # 1. Check Cache (Skip if force_refresh is True)
     if not force_refresh:
-        recent_outreach = get_recent_outreach(company_name, job_role)
-        if recent_outreach and not resume_content: # Only use cache if no resume provided (personalization changes output)
-             return {"results": recent_outreach, "usage": None}
+        recent_outreach = get_recent_outreach(
+            company_key,
+            role_key,
+            profile_hash,
+            PROMPT_VERSION,
+            search_mode,
+        )
+        if recent_outreach:
+            return {"results": recent_outreach, "usage": None, "cached": True}
 
     # 2. Setup Agents and Tasks
     agents = RecruiterOutreachAgents()
@@ -158,8 +300,14 @@ def run_recruiter_outreach(company_name: str, job_role: str, resume_content: str
     copywriter_agent = agents.copywriter_agent()
 
     research_task = tasks.research_task(research_agent, company_name, job_role)
-    ranking_task = tasks.ranking_task(ranking_agent, company_name, job_role)
-    drafting_task = tasks.drafting_task(copywriter_agent, resume_content) # Pass resume content
+    ranking_task = tasks.ranking_task(ranking_agent, company_name, job_role, context=[research_task])
+    drafting_task = tasks.drafting_task(
+        copywriter_agent,
+        company_name,
+        job_role,
+        resume_content,
+        context=[ranking_task],
+    )
 
     # 3. Create Crew
     crew = Crew(
@@ -171,55 +319,39 @@ def run_recruiter_outreach(company_name: str, job_role: str, resume_content: str
 
     # 4. Run Crew
     result = crew.kickoff()
-    
+
     # Capture Usage
-    usage = {}
     try:
-        raw_usage = None
-        if hasattr(crew, 'usage_metrics'):
-             raw_usage = crew.usage_metrics
-        elif hasattr(result, 'token_usage'):
-             raw_usage = result.token_usage
-        
-        if raw_usage:
-            # Convert object to dict to ensure .get() works downstream
-            if isinstance(raw_usage, dict):
-                usage = raw_usage
-            elif hasattr(raw_usage, 'model_dump'): # Pydantic v2
-                usage = raw_usage.model_dump()
-            elif hasattr(raw_usage, 'dict'): # Pydantic v1
-                usage = raw_usage.dict()
-            else:
-                # Fallback: access attributes directly
-                usage = {
-                    "prompt_tokens": getattr(raw_usage, "prompt_tokens", 0),
-                    "completion_tokens": getattr(raw_usage, "completion_tokens", 0),
-                    "total_tokens": getattr(raw_usage, "total_tokens", 0),
-                    "total_cost": getattr(raw_usage, "total_cost", 0.0)
-                }
-            
-            # Save to DB
+        usage = extract_usage_metrics(crew, result)
+        if usage:
             save_usage_log(usage)
-            
     except Exception as e:
         print(f"Could not extract usage metrics: {e}")
+        usage = {}
 
     # 5. Parse and Save Results
     try:
-        output_str = str(result)
-        outreach_data = clean_json_output(output_str)
-        
+        parsed_output = to_json_safe(get_structured_output(drafting_task, result))
+        outreach_data = extract_outreach_items(parsed_output)
+
         if outreach_data:
-            save_outreach(company_name, job_role, outreach_data)
-            return {"results": outreach_data, "usage": usage}
+            save_outreach(
+                company_key,
+                role_key,
+                outreach_data,
+                profile_hash,
+                PROMPT_VERSION,
+                search_mode,
+            )
+            return {"results": outreach_data, "usage": usage, "cached": False}
         else:
             print("Failed to generate valid outreach data.")
-            print(f"Raw Output: {output_str}")
-            return {"results": [], "usage": usage}
+            print(f"Raw Output: {result}")
+            return {"results": [], "usage": usage, "cached": False}
 
     except Exception as e:
         print(f"An error occurred: {e}")
-        return {"results": [], "usage": usage}
+        return {"results": [], "usage": usage, "cached": False}
 
 def run_profile_parsing(resume_text: str) -> Dict:
     """Run the agent to parse and summarize the resume."""
@@ -238,17 +370,13 @@ def run_profile_parsing(resume_text: str) -> Dict:
     )
     
     result = crew.kickoff()
-    
-    # Usage Tracking (Simplified repetition of logic - could be refactored)
-    usage = {}
-    if hasattr(crew, 'usage_metrics'):
-         usage = crew.usage_metrics if isinstance(crew.usage_metrics, dict) else crew.usage_metrics.dict()
-         save_usage_log(usage)
 
-    summary_json = str(result)
-    # Clean JSON
-    parsed = clean_json_output(summary_json)
-    
+    usage = extract_usage_metrics(crew, result)
+    if usage:
+        save_usage_log(usage)
+
+    parsed = to_json_safe(get_structured_output(parsing_task, result))
+
     # Save the RAW text and the SUMMARIZED json
     save_user_profile(resume_text, json.dumps(parsed))
     
@@ -279,13 +407,12 @@ def run_job_application(job_description: str) -> Dict:
     )
     
     result = crew.kickoff()
-    
-    usage = {}
-    if hasattr(crew, 'usage_metrics'):
-         usage = crew.usage_metrics if isinstance(crew.usage_metrics, dict) else crew.usage_metrics.dict()
-         save_usage_log(usage)
 
-    output = clean_json_output(str(result))
+    usage = extract_usage_metrics(crew, result)
+    if usage:
+        save_usage_log(usage)
+
+    output = to_json_safe(get_structured_output(drafting_task, result))
     return {"results": output, "usage": usage}
 
 def main():

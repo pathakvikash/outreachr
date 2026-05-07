@@ -1,6 +1,17 @@
 import streamlit as st
 import json
-from main import run_recruiter_outreach, run_profile_parsing, get_user_profile
+import os
+import pandas as pd
+from json import JSONDecodeError
+from models import db_session, init_db, UsageLog, RecruiterOutreach
+from main import (
+    run_recruiter_outreach,
+    run_profile_parsing,
+    get_user_profile,
+    run_job_application,
+)
+
+init_db()
 
 st.set_page_config(page_title="Recruiter Outreach", layout="wide")
 
@@ -20,7 +31,7 @@ with st.sidebar:
                 summary_data = json.loads(current_profile['summary_json'])
                 st.write("**Bio:**", summary_data.get("bio", "N/A"))
                 st.write("**Top Skills:**", ", ".join(summary_data.get("skills", [])))
-            except:
+            except (JSONDecodeError, TypeError):
                 st.text(current_profile['summary_json'])
     else:
         st.info("No profile stored. Upload a resume to get started.")
@@ -60,8 +71,8 @@ with tab1:
         if uploaded_resume_manual:
              resume_context = parse_pdf(uploaded_resume_manual)
     else:
-        # Use stored raw text or summary for context
-        resume_context = current_profile.get("raw_text")
+        # Prefer the structured summary to keep outreach prompts focused and cheaper.
+        resume_context = current_profile.get("summary_json") or current_profile.get("raw_text")
 
     uploaded_resume_sidebar = st.file_uploader("Update/Upload Resume (PDF)", type="pdf", key="sidebar_resume")
     
@@ -105,13 +116,13 @@ with tab1:
                 except Exception as e:
                     st.error(f"An error occurred: {e}")
 
-ation Assistant
+
 with tab2:
     st.header("Job Application Assistant")
     st.markdown("Generate a tailored Cold DM and Cover Letter for a specific Job Description.")
     
     if not current_profile:
-        st.warning("⚠️ Please upload your resume in the Sidebar to use this feature.")
+        st.warning("Please upload your resume in the Sidebar to use this feature.")
     else:
         jd_input = st.text_area("Paste Job Description (JD)", height=300, placeholder="Paste the full job description here...")
         
@@ -150,10 +161,11 @@ with tab3:
     if st.button("Refresh History"):
         st.rerun()
         
-    db = next(get_db())
-    
     st.subheader("Accumulated Usage")
-    usage_logs = db.query(UsageLog).all()
+    with db_session() as db:
+        usage_logs = db.query(UsageLog).all()
+        history = db.query(RecruiterOutreach).order_by(RecruiterOutreach.created_at.desc()).all()
+
     if usage_logs:
         total_tokens = sum(log.total_tokens for log in usage_logs)
         st.metric("Total Tokens Used (All Time)", total_tokens)
@@ -161,8 +173,7 @@ with tab3:
         st.info("No usage logs yet.")
 
     st.markdown("---")
-    history = db.query(RecruiterOutreach).order_by(RecruiterOutreach.created_at.desc()).all()
-    
+
     if history:
         data = [r.to_dict() | {"created_at": r.created_at, "company_name": r.company_name, "job_role": r.job_role} for r in history]
         df = pd.DataFrame(data)
@@ -187,15 +198,18 @@ with tab4:
     tavily_key = st.text_input("Tavily API Key", type="password", placeholder="sk-...", key="tavily_key")
     
     if st.button("Save API Keys"):
-        os.environ["OPENAI_API_KEY"] = openai_key
-        os.environ["TAVILY_API_KEY"] = tavily_key
-        st.success("API keys saved successfully!")
+        if openai_key:
+            os.environ["OPENAI_API_KEY"] = openai_key
+        if tavily_key:
+            os.environ["TAVILY_API_KEY"] = tavily_key
+        st.success("API keys updated for this Streamlit session.")
 
     st.markdown("---")
     st.markdown("### Database Settings")
     database_url = st.text_input("Database URL", placeholder="sqlite:///recruiter_outreach.db", key="database_url")
     
     if st.button("Save Database Settings"):
-        os.environ["DATABASE_URL"] = database_url
-        st.success("Database settings saved successfully!")
+        if database_url:
+            os.environ["DATABASE_URL"] = database_url
+            st.info("Restart the app for DATABASE_URL changes to rebuild the SQLAlchemy engine.")
 
